@@ -2,6 +2,7 @@
 # https://github.com/gepa-ai/gepa
 
 import traceback
+import time
 from collections.abc import Sequence
 from typing import Generic
 
@@ -41,6 +42,20 @@ try:
     from tqdm import tqdm
 except ImportError:
     tqdm = None
+
+
+def _format_duration(seconds: float | None) -> str:
+    """Format a duration in seconds into a compact human-readable string."""
+
+    if seconds is None:
+        return "unknown"
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes, remaining_seconds = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m {remaining_seconds}s"
+    hours, remaining_minutes = divmod(minutes, 60)
+    return f"{hours}h {remaining_minutes}m {remaining_seconds}s"
 
 
 class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
@@ -267,6 +282,8 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
         valset = self.valset
         if valset is None:
             raise ValueError("valset must be provided to GEPAEngine.run()")
+        optimization_start_time = time.perf_counter()
+        iteration_start_time_seconds: float | None = None
 
         def valset_evaluator(
             program: dict[str, str],
@@ -311,6 +328,10 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
             f"Iteration {state.i + 1}: Base program full valset score: {base_val_avg} "
             f"over {base_val_coverage} / {len(valset)} examples"
         )
+        self.logger.log(
+            "Optimization timing: elapsed=0.0s budget_used="
+            f"{state.total_num_evals} budget_remaining={self._get_remaining_budget(state)}"
+        )
 
         # Notify callbacks of optimization start
         notify_callbacks(
@@ -350,6 +371,24 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
 
         # Register budget hook to fire on_budget_updated callback in real-time
         def budget_hook(new_total: int, delta: int) -> None:
+            elapsed_seconds = time.perf_counter() - optimization_start_time
+            remaining_budget = self._get_remaining_budget(state)
+            evals_per_second: float | None = None
+            eta_seconds: float | None = None
+            if elapsed_seconds > 0.0:
+                evals_per_second = new_total / elapsed_seconds
+            if evals_per_second is not None and evals_per_second > 0.0 and remaining_budget is not None:
+                eta_seconds = remaining_budget / evals_per_second
+
+            rate_text = "unknown"
+            if evals_per_second is not None:
+                rate_text = f"{evals_per_second:.2f} eval/s"
+
+            self.logger.log(
+                "Budget update: used="
+                f"{new_total} delta={delta} remaining={remaining_budget} "
+                f"elapsed={_format_duration(elapsed_seconds)} rate={rate_text} eta={_format_duration(eta_seconds)}"
+            )
             notify_callbacks(
                 self.callbacks,
                 "on_budget_updated",
@@ -357,7 +396,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
                     iteration=state.i + 1,
                     metric_calls_used=new_total,
                     metric_calls_delta=delta,
-                    metric_calls_remaining=self._get_remaining_budget(state),
+                    metric_calls_remaining=remaining_budget,
                 ),
             )
 
@@ -391,6 +430,11 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
 
                 state.i += 1
                 state.full_program_trace.append({"i": state.i})
+                iteration_start_time_seconds = time.perf_counter()
+                self.logger.log(
+                    f"Iteration {state.i + 1}: Starting with total_metric_calls={state.total_num_evals} "
+                    f"remaining_budget={self._get_remaining_budget(state)}"
+                )
 
                 # Notify callbacks of iteration start
                 notify_callbacks(
@@ -558,6 +602,19 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
                 # Notify iteration end only if the iteration actually started
                 # (i.e., on_iteration_start was called successfully)
                 if iteration_started:
+                    elapsed_seconds = time.perf_counter() - optimization_start_time
+                    iteration_duration_seconds: float | None = None
+                    if iteration_start_time_seconds is not None:
+                        iteration_duration_seconds = time.perf_counter() - iteration_start_time_seconds
+                    best_candidate_idx = self.val_evaluation_policy.get_best_program(state)
+                    best_val_score, _ = state.get_program_average_val_subset(best_candidate_idx)
+                    self.logger.log(
+                        f"Iteration {state.i + 1}: Finished accepted={proposal_accepted} "
+                        f"iteration_duration={_format_duration(iteration_duration_seconds)} "
+                        f"elapsed={_format_duration(elapsed_seconds)} "
+                        f"total_metric_calls={state.total_num_evals} "
+                        f"best_candidate_idx={best_candidate_idx} best_val_score={best_val_score}"
+                    )
                     notify_callbacks(
                         self.callbacks,
                         "on_iteration_end",
@@ -585,6 +642,12 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
                 total_metric_calls=state.total_num_evals,
                 final_state=state,
             ),
+        )
+        total_elapsed_seconds = time.perf_counter() - optimization_start_time
+        self.logger.log(
+            "Optimization finished: "
+            f"best_candidate_idx={best_candidate_idx} total_iterations={state.i} "
+            f"total_metric_calls={state.total_num_evals} elapsed={_format_duration(total_elapsed_seconds)}"
         )
 
         return state
