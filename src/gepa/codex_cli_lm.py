@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -21,6 +22,8 @@ ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
 
 _DEFAULT_CODEX_MODEL = "gpt-5.3-codex-spark"
 _DEFAULT_REASONING_EFFORT: ReasoningEffort = "xhigh"
+_GLOBAL_CODEX_CLI_CONCURRENCY_LIMIT = 4
+_GLOBAL_CODEX_CLI_SEMAPHORE = threading.BoundedSemaphore(_GLOBAL_CODEX_CLI_CONCURRENCY_LIMIT)
 _CODEX_PROMPT_PREAMBLE = """You are acting as a pure language model backend inside GEPA.
 Use only the instructions and context included below.
 Do not inspect files, run commands, browse the web, or ask for more context.
@@ -135,41 +138,42 @@ def _run_codex_cli_prompt(prompt: str | list[dict[str, Any]], config: CodexCLILM
             "Codex CLI auth.json was not found. Run `codex login` before using the codex_cli backend."
         )
 
-    with tempfile.TemporaryDirectory(prefix="gepa-codex-work-") as work_dir_name:
-        work_dir = Path(work_dir_name)
-        prompt_text, image_paths = _prepare_prompt_payload(prompt=prompt, scratch_dir=work_dir)
-        output_path = work_dir / "codex_output.txt"
-        command = _build_codex_command(
-            config=config,
-            work_dir=work_dir,
-            output_path=output_path,
-            image_paths=image_paths,
-        )
-
-        completed = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            env=os.environ.copy(),
-            input=prompt_text,
-            text=True,
-            timeout=config.timeout_seconds,
-        )
-        if completed.returncode != 0:
-            stdout = completed.stdout.strip()
-            stderr = completed.stderr.strip()
-            raise RuntimeError(
-                "Codex CLI reflection backend failed with exit code "
-                f"{completed.returncode}. stdout={stdout!r} stderr={stderr!r}"
+    with _GLOBAL_CODEX_CLI_SEMAPHORE:
+        with tempfile.TemporaryDirectory(prefix="gepa-codex-work-") as work_dir_name:
+            work_dir = Path(work_dir_name)
+            prompt_text, image_paths = _prepare_prompt_payload(prompt=prompt, scratch_dir=work_dir)
+            output_path = work_dir / "codex_output.txt"
+            command = _build_codex_command(
+                config=config,
+                work_dir=work_dir,
+                output_path=output_path,
+                image_paths=image_paths,
             )
 
-        if output_path.is_file() is False:
-            raise RuntimeError("Codex CLI reflection backend did not produce an output-last-message file.")
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                env=os.environ.copy(),
+                input=prompt_text,
+                text=True,
+                timeout=config.timeout_seconds,
+            )
+            if completed.returncode != 0:
+                stdout = completed.stdout.strip()
+                stderr = completed.stderr.strip()
+                raise RuntimeError(
+                    "Codex CLI reflection backend failed with exit code "
+                    f"{completed.returncode}. stdout={stdout!r} stderr={stderr!r}"
+                )
 
-        output_text = output_path.read_text(encoding="utf-8").strip()
-        if len(output_text) == 0:
-            raise RuntimeError("Codex CLI reflection backend produced an empty response.")
-        return output_text
+            if output_path.is_file() is False:
+                raise RuntimeError("Codex CLI reflection backend did not produce an output-last-message file.")
+
+            output_text = output_path.read_text(encoding="utf-8").strip()
+            if len(output_text) == 0:
+                raise RuntimeError("Codex CLI reflection backend produced an empty response.")
+            return output_text
 
 
 def _resolve_source_codex_home() -> Path:

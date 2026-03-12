@@ -79,8 +79,21 @@ class TestMakeBackendLm:
         monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
         captured: dict[str, object] = {}
+        semaphore_events: list[str] = []
+
+        class FakeSemaphore:
+            """Test semaphore that records entry and exit order."""
+
+            def __enter__(self) -> None:
+                semaphore_events.append("enter")
+                return None
+
+            def __exit__(self, exc_type, exc, exc_tb) -> None:
+                semaphore_events.append("exit")
+                return None
 
         def fake_run(command, **kwargs):
+            assert semaphore_events == ["enter"]
             captured["command"] = command
             captured["kwargs"] = kwargs
             output_path = Path(command[command.index("--output-last-message") + 1])
@@ -93,11 +106,15 @@ class TestMakeBackendLm:
 
             return Result()
 
-        with patch("gepa.codex_cli_lm.subprocess.run", side_effect=fake_run):
+        with (
+            patch("gepa.codex_cli_lm._GLOBAL_CODEX_CLI_SEMAPHORE", FakeSemaphore()),
+            patch("gepa.codex_cli_lm.subprocess.run", side_effect=fake_run),
+        ):
             lm = oa.make_backend_lm("codex_cli")
             result = lm("hello world")
 
         assert result == "mocked output"
+        assert semaphore_events == ["enter", "exit"]
         kwargs = captured["kwargs"]
         assert isinstance(kwargs["input"], str)
         assert "hello world" in kwargs["input"]
