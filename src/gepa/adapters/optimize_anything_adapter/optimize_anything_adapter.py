@@ -17,6 +17,7 @@ import json
 import logging
 import pickle
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -184,13 +185,27 @@ class OptimizeAnythingAdapter(GEPAAdapter):
         example: Any,
     ) -> tuple[float, Any, dict]:
         """Call evaluator with optional caching."""
+        candidate_hash = self._candidate_hash(candidate)
+        example_hash = self._example_hash(example)
+        started_at = time.perf_counter()
+        print(
+            f"[gepa:adapter:evaluator:start] candidate={candidate_hash} example={example_hash} cache_mode={self.cache_mode}",
+            flush=True,
+        )
         # No caching
         if self.cache_mode == "off":
-            return self.evaluator(
+            result = self.evaluator(
                 candidate,
                 example=example,
                 opt_state=self._build_opt_state(example),
             )
+            elapsed = time.perf_counter() - started_at
+            print(
+                f"[gepa:adapter:evaluator:done] candidate={candidate_hash} example={example_hash} "
+                f"cache=off score={result[0]:.3f} elapsed={elapsed:.1f}s",
+                flush=True,
+            )
+            return result
 
         # Build cache key
         cache_key = self._cache_key(candidate, example)
@@ -198,7 +213,19 @@ class OptimizeAnythingAdapter(GEPAAdapter):
         # Check cache (thread-safe)
         with self._eval_cache_lock:
             if cache_key in self._eval_cache:
-                return self._eval_cache[cache_key]
+                result = self._eval_cache[cache_key]
+                elapsed = time.perf_counter() - started_at
+                print(
+                    f"[gepa:adapter:evaluator:done] candidate={candidate_hash} example={example_hash} "
+                    f"cache=hit score={result[0]:.3f} elapsed={elapsed:.1f}s",
+                    flush=True,
+                )
+                return result
+
+        print(
+            f"[gepa:adapter:evaluator:cache_miss] candidate={candidate_hash} example={example_hash}",
+            flush=True,
+        )
 
         # Cache miss - call evaluator
         result = self.evaluator(
@@ -213,6 +240,12 @@ class OptimizeAnythingAdapter(GEPAAdapter):
             if self.cache_mode == "disk":
                 self._save_cache_entry(cache_key, result)
 
+        elapsed = time.perf_counter() - started_at
+        print(
+            f"[gepa:adapter:evaluator:done] candidate={candidate_hash} example={example_hash} "
+            f"cache=miss score={result[0]:.3f} elapsed={elapsed:.1f}s",
+            flush=True,
+        )
         return result
 
     def evaluate(
@@ -228,6 +261,13 @@ class OptimizeAnythingAdapter(GEPAAdapter):
         Multi-objective scores from ``side_info["scores"]`` are extracted and
         forwarded as ``objective_scores`` in the returned batch.
         """
+        candidate_hash = self._candidate_hash(candidate)
+        started_at = time.perf_counter()
+        print(
+            f"[gepa:adapter:batch:start] candidate={candidate_hash} batch_size={len(batch)} "
+            f"parallel={self.parallel} capture_traces={capture_traces} refiner={self.refiner_config is not None}",
+            flush=True,
+        )
         # Backward compatibility: if refiner_config is None, use old behavior
         if self.refiner_config is None:
             # Old path: direct evaluation without refinement
@@ -271,9 +311,19 @@ class OptimizeAnythingAdapter(GEPAAdapter):
 
             objective_scores.append(objective_score)
 
-        return EvaluationBatch(
+        evaluation_batch = EvaluationBatch(
             outputs=outputs, scores=scores, trajectories=side_infos, objective_scores=objective_scores
         )
+        elapsed = time.perf_counter() - started_at
+        mean_score = 0.0
+        if len(scores) > 0:
+            mean_score = sum(scores) / len(scores)
+        print(
+            f"[gepa:adapter:batch:done] candidate={candidate_hash} batch_size={len(batch)} "
+            f"mean_score={mean_score:.3f} elapsed={elapsed:.1f}s",
+            flush=True,
+        )
+        return evaluation_batch
 
     def _evaluate_with_refinement(
         self,
