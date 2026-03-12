@@ -122,6 +122,7 @@ from typing import (
 )
 
 from gepa.adapters.optimize_anything_adapter.optimize_anything_adapter import OptimizeAnythingAdapter
+from gepa.codex_cli_lm import CodexCLILMConfig, make_codex_cli_lm, parse_codex_cli_spec
 from gepa.core.adapter import DataInst, GEPAAdapter, ProposalFn
 from gepa.core.data_loader import ensure_loader
 from gepa.core.engine import GEPAEngine
@@ -711,7 +712,7 @@ class ReflectionConfig:
     batch_sampler: BatchSampler | Literal["epoch_shuffled"] = "epoch_shuffled"
     reflection_minibatch_size: int | None = None  # Default: 1 for single-instance mode, 3 otherwise
     module_selector: ReflectionComponentSelector | Literal["round_robin", "all"] = "round_robin"
-    reflection_lm: LanguageModel | str | None = "openai/gpt-5.1"
+    reflection_lm: LanguageModel | str | CodexCLILMConfig | None = "openai/gpt-5.1"
     reflection_prompt_template: str | dict[str, str] | None = optimize_anything_reflection_prompt_template
     custom_candidate_proposer: ProposalFn | None = None
 
@@ -766,7 +767,7 @@ class RefinerConfig:
     """
 
     # Language model for refinement (defaults to reflection_lm if not specified)
-    refiner_lm: LanguageModel | str | None = None
+    refiner_lm: LanguageModel | str | CodexCLILMConfig | None = None
 
     # Maximum refinement iterations per evaluation
     max_refinements: int = 1
@@ -856,6 +857,24 @@ def make_litellm_lm(model_name: str) -> LanguageModel:
         return completion.choices[0].message.content  # type: ignore[union-attr]
 
     return _lm
+
+
+def make_backend_lm(lm_spec: str | CodexCLILMConfig) -> LanguageModel:
+    """Convert a configured backend spec to a :class:`LanguageModel`.
+
+    :param lm_spec: Either a LiteLLM model string, a ``codex_cli`` backend
+        string, or a :class:`CodexCLILMConfig`.
+    :returns: Language-model callable compatible with GEPA reflection hooks.
+    """
+
+    if isinstance(lm_spec, CodexCLILMConfig):
+        return make_codex_cli_lm(lm_spec)
+
+    codex_config = parse_codex_cli_spec(lm_spec)
+    if codex_config is not None:
+        return make_codex_cli_lm(codex_config)
+
+    return make_litellm_lm(lm_spec)
 
 
 class EvaluatorWrapper:
@@ -1257,14 +1276,14 @@ def optimize_anything(
     if config.refiner is not None and config.refiner.refiner_lm is None:
         config.refiner.refiner_lm = config.reflection.reflection_lm
 
-    # Convert reflection_lm string to callable
-    if isinstance(config.reflection.reflection_lm, str):
-        config.reflection.reflection_lm = make_litellm_lm(config.reflection.reflection_lm)
+    # Convert reflection_lm backend specs to callables
+    if isinstance(config.reflection.reflection_lm, str | CodexCLILMConfig):
+        config.reflection.reflection_lm = make_backend_lm(config.reflection.reflection_lm)
 
-    # Convert refiner_lm string to LiteLLM callable (if refiner is enabled)
+    # Convert refiner_lm backend specs to callables (if refiner is enabled)
     if config.refiner is not None:
-        if isinstance(config.refiner.refiner_lm, str):
-            config.refiner.refiner_lm = make_litellm_lm(config.refiner.refiner_lm)
+        if isinstance(config.refiner.refiner_lm, str | CodexCLILMConfig):
+            config.refiner.refiner_lm = make_backend_lm(config.refiner.refiner_lm)
 
     # Generate seed candidate via LLM if seed_candidate was None
     if needs_seed_generation:
